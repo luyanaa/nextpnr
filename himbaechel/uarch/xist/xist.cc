@@ -159,13 +159,6 @@ struct XistImpl : HimbaechelAPI
                 dffs.push_back(cell.second.get());
 
         for (CellInfo *dff : dffs) {
-            // CE / reset / set are slice-level muxes (CEMUX, LSRMUX) whose
-            // routing and configuration are not modelled yet.
-            if (dff->getPort(ctx->id("CE")) || dff->getPort(ctx->id("R")) ||
-                dff->getPort(ctx->id("S")))
-                log_error("DFF %s has a clock-enable/reset/set pin; XIST does not "
-                          "model CEMUX/LSRMUX yet\n", ctx->nameOf(dff));
-
             // The DFF data input must come from a LUT in the same bank: the
             // slice DI wire is driven only by that bank's LUT (F -> DI pip).
             NetInfo *d_net = dff->getPort(id_D);
@@ -214,8 +207,31 @@ struct XistImpl : HimbaechelAPI
         const CellInfo *bound = ctx->getBoundBelCell(bel);
         if (bound == nullptr)
             return true;   // empty bel: nothing to validate yet
-        if (bound->cluster != ClusterId())
-            return true;   // clustered DFF is placed next to its data LUT
+        // CLK/CE/LSR muxes are slice-wide: both DFF banks must use the same
+        // clock, and either both use the same enable/reset net or neither
+        // does.  (A single used bank is fine - nothing to compare against.)
+        {
+            auto bel_name = ctx->getBelName(bel);
+            std::string name = bel_name[1].str(ctx);
+            if (!name.empty() && isdigit(name.back())) {
+                int bank = name.back() - '0';
+                auto sibling = ctx->getBelByName(IdStringList::concat(
+                        bel_name[0], ctx->idf("DFF%d", bank ^ 1)));
+                const CellInfo *other = ctx->getBoundBelCell(sibling);
+                if (other != nullptr && other->type == id_DFF) {
+                    for (IdString port : {id_CLK, id_CE, id_R, id_S}) {
+                        if (bound->getPort(port) != other->getPort(port)) {
+                            if (explain_invalid)
+                                log_error("DFF %s and %s are in one slice: their "
+                                          "shared %s control nets differ\n",
+                                          ctx->nameOf(bound), ctx->nameOf(other),
+                                          port.c_str(ctx));
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
 
         {
             // The DFF data input is the slice output mux (OFX -> DI), which is

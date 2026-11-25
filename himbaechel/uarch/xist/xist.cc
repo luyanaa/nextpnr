@@ -60,6 +60,7 @@ struct XistImpl : HimbaechelAPI
         h.remove_nextpnr_iobs(top_ports);
         pack_constants();
         pack_pad_regs();
+        pack_pad_iologic();
         pack_lut_dff();
     }
 
@@ -165,6 +166,85 @@ struct XistImpl : HimbaechelAPI
         return packed;
     }
 
+    // Move an input register or a DDR cell into the pad's IOLOGIC block.
+    //
+    // The vendor's IOLOGIC is wired straight to the pad buffer: the input
+    // register and IDDR read JDI<slot> (the pad's data net) and return the
+    // positive/negative edge samples on the CIB's F/A nets; ODDR takes its two
+    // data inputs from the fabric and drives IOLDO.  Nothing can be inserted
+    // between them and the buffer (this is why nextpnr-gowin cannot route a
+    // DDR through an inverter), so these cells must be packed here.
+    //
+    // Detection: an ODDR/IDDR cell, or a DFF clocked by a net that a pad also
+    // uses, whose output is consumed by routing rather than by a slice LUT.
+    int pack_pad_iologic()
+    {
+        int packed = 0;
+        std::vector<CellInfo *> candidates;
+        for (auto &cell : ctx->cells)
+            if (cell.second->cluster == ClusterId() &&
+                cell.second->type.in(id_ODDR, id_IDDR, id_DFF))
+                candidates.push_back(cell.second.get());
+
+        for (CellInfo *ci : candidates) {
+            if (ci->cluster != ClusterId())
+                continue;
+            bool is_ddr = ci->type.in(id_ODDR, id_IDDR);
+            // find the pad this cell belongs to: a PIO whose data net is the
+            // cell's input (IDDR) or whose IOLDO net the cell drives (ODDR)
+            CellInfo *pio = nullptr;
+            if (is_ddr || ci->type == id_DFF) {
+                NetInfo *d = ci->getPort(ci->type == id_ODDR ? id_D0 : id_D);
+                if (d != nullptr && d->driver.cell != nullptr &&
+                    d->driver.cell->type == id_PIO)
+                    pio = d->driver.cell;      // pad -> cell (input side)
+            }
+            if (pio == nullptr && is_ddr) {
+                NetInfo *q = ci->getPort(id_Q);
+                if (q != nullptr && q->users.entries() == 1) {
+                    PortRef usr = *q->users.begin();
+                    if (usr.cell->type == id_PIO)
+                        pio = usr.cell;        // cell -> pad (output side)
+                }
+            }
+            if (pio == nullptr || pio->cluster != ClusterId())
+                continue;
+            // the pad must not have a slice register of its own
+            if (pio->getPort(id_IOLDO) != nullptr || pio->getPort(id_PADDO) == nullptr)
+                continue;
+
+            if (is_ddr) {
+                ci->params[id_PAD_DDR] = Property(1);
+                // D1 comes from the fabric net that currently feeds Q1/A
+                NetInfo *in0 = ci->getPort(id_D0);
+                NetInfo *in1 = ci->getPort(id_D1);
+                if (in0 == nullptr || in1 == nullptr)
+                    continue;
+                NetInfo *out = ci->getPort(id_Q);
+                if (out == nullptr)
+                    continue;
+                pio->disconnectPort(id_PADDO);
+                pio->addInput(id_IOLDO);
+                pio->connectPort(id_IOLDO, out);
+            } else {
+                ci->params[id_PAD_IREG] = Property(1);
+            }
+
+            pio->cluster = pio->name;
+            pio->constr_abs_z = false;
+            ci->cluster = pio->name;
+            ci->constr_x = 0;
+            ci->constr_y = 0;
+            ci->constr_z = is_ddr ? 12 : 8;   // IOLOD/IOLI slots
+            ci->constr_abs_z = false;
+            pio->constr_children.push_back(ci);
+            ++packed;
+        }
+        if (packed)
+            log_info("XIST: packed %d cells into pad IOLOGIC\n", packed);
+        return packed;
+    }
+
     // nextpnr clusters are built directly: the root cell names the cluster
     // (ClusterId is an IdString) and children record their bel offset relative
     // to the root.  Every PLC tile has the same z layout - LUT<n> at
@@ -240,6 +320,22 @@ struct XistImpl : HimbaechelAPI
     bool isBelLocationValid(BelId bel, bool explain_invalid) const override
     {
         IdString bel_type = ctx->getBelType(bel);
+        if (bel_type.in(id_IOLOGICI, id_ODDR)) {
+            const CellInfo *b = ctx->getBoundBelCell(bel);
+            if (b == nullptr)
+                return true;
+            bool want_ddr = bel_type == id_ODDR;
+            bool is_ddr = b->params.count(id_PAD_DDR) != 0;
+            bool is_ireg = b->params.count(id_PAD_IREG) != 0;
+            if (want_ddr != is_ddr || (!want_ddr && !is_ireg)) {
+                if (explain_invalid)
+                    log_error("%s on %s: pad IOLOGIC cells must be packed by "
+                              "their pad\n", ctx->nameOf(b),
+                              ctx->getBelName(bel).str(ctx).c_str());
+                return false;
+            }
+            return true;
+        }
         if (bel_type != id_DFF)
             return true;
 
@@ -329,6 +425,10 @@ struct XistImpl : HimbaechelAPI
         IdString bel_type = ctx->getBelType(bel);
         if (bel_type == id_PIO)
             return cell_type.in(id_PIO, id_IBUF, id_OBUF);
+        // the IOLOGIC input bel hosts either a plain input register or IDDR;
+        // both are placed as DFF/IDDR cells and validated by PAD_IREG/PAD_DDR.
+        if (bel_type == id_IOLOGICI)
+            return cell_type.in(id_DFF, id_IDDR);
         return bel_type == cell_type;
     }
 

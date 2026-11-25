@@ -59,6 +59,7 @@ struct XistImpl : HimbaechelAPI
         };
         h.remove_nextpnr_iobs(top_ports);
         pack_constants();
+        pack_pad_regs();
         pack_lut_dff();
     }
 
@@ -122,6 +123,46 @@ struct XistImpl : HimbaechelAPI
                           ctx->nameOf(ni), ctx->nameOf(usr.cell),
                           usr.port.c_str(ctx));
         }
+    }
+
+    // Move the register feeding an output pad into that pad's IOLOGIC block.
+    // The pad then selects IOLDO instead of PADDO, the DFF drives IOLDO, and
+    // the D input routes to JOPOS (wired to the adjacent CIB A<s>).
+    int pack_pad_regs()
+    {
+        int packed = 0;
+        for (auto &cell : ctx->cells) {
+            auto *pio = cell.second.get();
+            if (pio->type != id_PIO || pio->cluster != ClusterId())
+                continue;
+            NetInfo *pad_net = pio->getPort(id_PADDO);
+            if (pad_net == nullptr || pad_net->driver.cell == nullptr)
+                continue;
+            auto *dff = pad_net->driver.cell;
+            if (dff->type != id_DFF || dff->cluster != ClusterId())
+                continue;
+            if (pad_net->users.entries() != 1)
+                continue;   // registered output with fanout stays in a slice
+
+            // PIO: PADDO -> IOLDO (the IOLOGIC output)
+            pio->disconnectPort(id_PADDO);
+            pio->addInput(id_IOLDO);
+            pio->connectPort(id_IOLDO, pad_net);
+
+            dff->params[id_PAD_REG] = Property(1);
+            pio->cluster = pio->name;
+            pio->constr_abs_z = false;
+            dff->cluster = pio->name;
+            dff->constr_x = 0;
+            dff->constr_y = 0;
+            dff->constr_z = 4;      // PIO_<s> at s, IOLO<s> at 4+s
+            dff->constr_abs_z = false;
+            pio->constr_children.push_back(dff);
+            ++packed;
+        }
+        if (packed)
+            log_info("XIST: packed %d output registers into IOLOGIC\n", packed);
+        return packed;
     }
 
     // nextpnr clusters are built directly: the root cell names the cluster
@@ -207,6 +248,23 @@ struct XistImpl : HimbaechelAPI
         const CellInfo *bound = ctx->getBoundBelCell(bel);
         if (bound == nullptr)
             return true;   // empty bel: nothing to validate yet
+        // IOLOGIC registers live on IOLO bels; a random DFF must not land there
+        {
+            auto bel_name = ctx->getBelName(bel);
+            std::string name = bel_name[1].str(ctx);
+            bool iol = name.rfind("IOLO", 0) == 0;
+            bool pad_reg = bound->params.count(id_PAD_REG) != 0;
+            if (iol != pad_reg) {
+                if (explain_invalid)
+                    log_error("DFF %s on %s: IOLOGIC registers must be packed "
+                              "by the pad (PAD_REG)\n",
+                              ctx->nameOf(bound), ctx->getBelName(bel).str(ctx).c_str());
+                return false;
+            }
+            if (iol)
+                return true;
+        }
+
         // CLK/CE/LSR muxes are slice-wide: both DFF banks must use the same
         // clock, and either both use the same enable/reset net or neither
         // does.  (A single used bank is fine - nothing to compare against.)
@@ -217,6 +275,8 @@ struct XistImpl : HimbaechelAPI
                 int bank = name.back() - '0';
                 auto sibling = ctx->getBelByName(IdStringList::concat(
                         bel_name[0], ctx->idf("DFF%d", bank ^ 1)));
+                if (sibling == BelId())
+                    return true;
                 const CellInfo *other = ctx->getBoundBelCell(sibling);
                 if (other != nullptr && other->type == id_DFF) {
                     for (IdString port : {id_CLK, id_CE, id_R, id_S}) {

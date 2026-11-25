@@ -14,7 +14,6 @@
 #include "log.h"
 #include "nextpnr.h"
 #include "util.h"
-#include <cstdlib>
 
 #include "himbaechel_helpers.h"
 
@@ -49,21 +48,6 @@ struct XistImpl : HimbaechelAPI
     {
         h.init(ctx);
         HimbaechelAPI::init(ctx);
-        if (std::getenv("XIST_DUMP")) {
-            const std::pair<const char *, const char *> wires[] = {
-                {"X19Y39", "JDIA"}, {"X19Y20", "CLK"}, {"X19Y20", "CIB0"}};
-            for (auto &tw : wires) {
-                WireId w = ctx->getWireByName(
-                    IdStringList::concat(ctx->id(tw.first), ctx->id(tw.second)));
-                log_info("DUMP wire %s/%s id=%d\n", tw.first, tw.second, w.index);
-                for (auto pip : ctx->getPipsDownhill(w))
-                    log_info("  dh %s/%s -> %s\n", tw.first, tw.second,
-                             ctx->getWireName(ctx->getPipDstWire(pip)).str(ctx).c_str());
-                for (auto pip : ctx->getPipsUphill(w))
-                    log_info("  uh %s/%s -> %s\n", tw.first, tw.second,
-                             ctx->getWireName(ctx->getPipSrcWire(pip)).str(ctx).c_str());
-            }
-        }
     }
 
     void pack() override
@@ -74,13 +58,186 @@ struct XistImpl : HimbaechelAPI
                 CellTypePort(id_PIO, id_PAD),
         };
         h.remove_nextpnr_iobs(top_ports);
-        // Constants and LUT/DFF pairing are TODO.
+        pack_constants();
+        pack_lut_dff();
+    }
+
+    // The vendor slice muxes take GND as one of their four inputs (BFD:
+    // ``arcval(GND,M0)``), so an unconnected LUT input reads 0.  Constants
+    // that drive a LUT input are therefore folded into the INIT and the port
+    // is dropped; any other constant use has no source in the fabric and is
+    // rejected instead of silently producing a wrong bitstream.
+    void pack_constants()
+    {
+        std::vector<IdString> dead_cells;
+        for (auto &cell : ctx->cells) {
+            CellInfo *ci = cell.second.get();
+            if (ci->type != id_VCC && ci->type != id_GND)
+                continue;
+            NetInfo *net = ci->getPort(id_Y);
+            if (net != nullptr) {
+                net->constant_value = (ci->type == id_VCC) ? id_VCC : id_GND;
+                ci->disconnectPort(id_Y);
+            }
+            dead_cells.push_back(ci->name);
+        }
+        for (IdString name : dead_cells)
+            ctx->cells.erase(name);
+
+
+        for (auto &cell : ctx->cells) {
+            CellInfo *ci = cell.second.get();
+            if (ci->type != id_LUT4)
+                continue;
+            for (int i = 0; i < 4; i++) {
+                IdString port = ctx->idf("I[%d]", i);
+                auto p = ci->ports.find(port);
+                if (p == ci->ports.end() || p->second.net == nullptr)
+                    continue;
+                NetInfo *net = p->second.net;
+                if (net->constant_value != id_VCC && net->constant_value != id_GND)
+                    continue;
+                if (ci->params.count(id_INIT) == 0)
+                    log_error("LUT %s has no INIT\n", ctx->nameOf(ci));
+                int64_t init = ci->params.at(id_INIT).intval;
+                int64_t folded = 0;
+                for (int b = 0; b < 16; b++) {
+                    int src = (net->constant_value == id_GND) ? (b & ~(1 << i))
+                                                              : (b | (1 << i));
+                    if ((init >> src) & 1)
+                        folded |= int64_t(1) << b;
+                }
+                ci->params[id_INIT] = Property(folded, 16);
+                ci->disconnectPort(port);
+            }
+        }
+
+        // Anything still on a constant net cannot be driven by the fabric.
+        for (auto &net : ctx->nets) {
+            NetInfo *ni = net.second.get();
+            if (ni->constant_value == IdString() || ni->users.entries() == 0)
+                continue;
+            for (auto &usr : ni->users)
+                log_error("constant net %s drives %s/%s; XIST has no VCC source\n",
+                          ctx->nameOf(ni), ctx->nameOf(usr.cell),
+                          usr.port.c_str(ctx));
+        }
+    }
+
+    // nextpnr clusters are built directly: the root cell names the cluster
+    // (ClusterId is an IdString) and children record their bel offset relative
+    // to the root.  Every PLC tile has the same z layout - LUT<n> at
+    // 4s+{0,1} and its DFF<n> at 4s+{2,3} - so a DFF is attached to the LUT
+    // driving its D net at a fixed +2 z offset.
+    static constexpr int LUT_DFF_DZ = 2;
+
+    // A DFF whose D comes straight from a pad or another register has no LUT
+    // in its bank.  The slice only feeds DI from its own output mux, so insert
+    // the identity LUT the vendor would use (INIT = 0xAAAA, buffer on I[0])
+    // and then cluster it like any other LUT/DFF pair.
+    CellInfo *make_dff_lut(CellInfo *dff, NetInfo *d_net)
+    {
+        CellInfo *lut = ctx->createCell(ctx->idf("%s_DLUT", dff->name.c_str(ctx)), id_LUT4);
+        IdString i0 = ctx->idf("I[0]");
+        lut->addInput(i0);
+        lut->addOutput(id_F);
+        lut->params[id_INIT] = Property(int64_t(0xAAAA), 16);
+        NetInfo *f = ctx->createNet(ctx->idf("%s_DF", dff->name.c_str(ctx)));
+        lut->connectPort(i0, d_net);
+        lut->connectPort(id_F, f);
+        dff->disconnectPort(id_D);
+        dff->connectPort(id_D, f);
+        return lut;
+    }
+
+    int pack_lut_dff()
+    {
+        int paired = 0, unpaired = 0;
+        std::vector<CellInfo *> dffs;
+        for (auto &cell : ctx->cells)
+            if (cell.second->type == id_DFF && cell.second->cluster == ClusterId())
+                dffs.push_back(cell.second.get());
+
+        for (CellInfo *dff : dffs) {
+            // CE / reset / set are slice-level muxes (CEMUX, LSRMUX) whose
+            // routing and configuration are not modelled yet.
+            if (dff->getPort(ctx->id("CE")) || dff->getPort(ctx->id("R")) ||
+                dff->getPort(ctx->id("S")))
+                log_error("DFF %s has a clock-enable/reset/set pin; XIST does not "
+                          "model CEMUX/LSRMUX yet\n", ctx->nameOf(dff));
+
+            // The DFF data input must come from a LUT in the same bank: the
+            // slice DI wire is driven only by that bank's LUT (F -> DI pip).
+            NetInfo *d_net = dff->getPort(id_D);
+            if (d_net == nullptr) {
+                ++unpaired;
+                continue;
+            }
+            CellInfo *lut = nullptr;
+            if (d_net->driver.cell != nullptr && d_net->driver.cell->type == id_LUT4)
+                lut = d_net->driver.cell;
+            if (lut == nullptr) {
+                lut = make_dff_lut(dff, d_net);
+                d_net = dff->getPort(id_D);
+            }
+            if (lut->cluster != ClusterId()) {
+                // one LUT can only feed its own bank DFF; a shared LUT would
+                // need replication, which is not implemented
+                ++unpaired;
+                continue;
+            }
+
+            lut->cluster = lut->name;
+            lut->constr_abs_z = false;
+            dff->cluster = lut->name;
+            dff->constr_x = 0;
+            dff->constr_y = 0;
+            dff->constr_z = LUT_DFF_DZ;
+            dff->constr_abs_z = false;
+            lut->constr_children.push_back(dff);
+            ++paired;
+        }
+        if (paired || unpaired)
+            log_info("XIST: packed %d LUT+DFF slices, %d DFF with no LUT source\n",
+                     paired, unpaired);
+        return paired;
     }
 
     bool isBelLocationValid(BelId bel, bool explain_invalid) const override
     {
-        (void)bel;
-        (void)explain_invalid;
+        IdString bel_type = ctx->getBelType(bel);
+        if (bel_type != id_DFF)
+            return true;
+
+        // A clustered DFF is always placed together with the LUT that feeds
+        // its D input, so the data-path rule below cannot fail for it.
+        const CellInfo *bound = ctx->getBoundBelCell(bel);
+        if (bound == nullptr)
+            return true;   // empty bel: nothing to validate yet
+        if (bound->cluster != ClusterId())
+            return true;   // clustered DFF is placed next to its data LUT
+
+        {
+            // The DFF data input is the slice output mux (OFX -> DI), which is
+            // fed by the same bank's LUT (or the carry chain).  Routing cannot
+            // reach DI directly, so a DFF with no used LUT in its bank is not
+            // implementable.
+            auto bel_name = ctx->getBelName(bel);
+            const std::string name = bel_name[1].str(ctx);
+            if (!name.empty() && isdigit(name.back())) {
+                const int bank = name.back() - '0';
+                const auto lut = ctx->getBelByName(
+                        IdStringList::concat(bel_name[0], ctx->idf("LUT%d", bank)));
+                if (lut != BelId() && ctx->checkBelAvail(lut)) {
+                    if (explain_invalid)
+                        log_error("DFF %s needs LUT%d in the same slice bank: its "
+                                  "D input is the slice output mux (OFX->DI), which "
+                                  "routing cannot drive.\n",
+                                  ctx->getBelName(bel).str(ctx).c_str(), bank);
+                    return false;
+                }
+            }
+        }
         return true;
     }
 

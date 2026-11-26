@@ -193,19 +193,26 @@ struct XistImpl : HimbaechelAPI
             // find the pad this cell belongs to: a PIO whose data net is the
             // cell's input (IDDR) or whose IOLDO net the cell drives (ODDR)
             CellInfo *pio = nullptr;
-            if (is_ddr || ci->type == id_DFF) {
-                NetInfo *d = ci->getPort(ci->type == id_ODDR ? id_D0 : id_D);
-                if (d != nullptr && d->driver.cell != nullptr &&
-                    d->driver.cell->type == id_PIO)
-                    pio = d->driver.cell;      // pad -> cell (input side)
-            }
-            if (pio == nullptr && is_ddr) {
+            if (is_ddr) {
+                // an ODDR/ODDR2 drives the pad; an IDDR is fed by it
                 NetInfo *q = ci->getPort(id_Q);
-                if (q != nullptr && q->users.entries() == 1) {
+                if (ci->type == id_ODDR && q != nullptr &&
+                    q->users.entries() == 1) {
                     PortRef usr = *q->users.begin();
                     if (usr.cell->type == id_PIO)
                         pio = usr.cell;        // cell -> pad (output side)
                 }
+                if (pio == nullptr && ci->type == id_IDDR) {
+                    NetInfo *d = ci->getPort(id_D);
+                    if (d != nullptr && d->driver.cell != nullptr &&
+                        d->driver.cell->type == id_PIO)
+                        pio = d->driver.cell;  // pad -> cell (input side)
+                }
+            } else if (ci->type == id_DFF) {
+                NetInfo *d = ci->getPort(id_D);
+                if (d != nullptr && d->driver.cell != nullptr &&
+                    d->driver.cell->type == id_PIO)
+                    pio = d->driver.cell;
             }
             if (pio == nullptr || pio->cluster != ClusterId())
                 continue;
@@ -215,10 +222,11 @@ struct XistImpl : HimbaechelAPI
 
             if (is_ddr) {
                 ci->params[id_PAD_DDR] = Property(1);
-                // D1 comes from the fabric net that currently feeds Q1/A
                 NetInfo *in0 = ci->getPort(id_D0);
-                NetInfo *in1 = ci->getPort(id_D1);
-                if (in0 == nullptr || in1 == nullptr)
+                if (in0 == nullptr)
+                    continue;
+                // xsODDRX2 has D2/D3 as well; require at least two inputs
+                if (ci->getPort(id_D1) == nullptr)
                     continue;
                 NetInfo *out = ci->getPort(id_Q);
                 if (out == nullptr)
